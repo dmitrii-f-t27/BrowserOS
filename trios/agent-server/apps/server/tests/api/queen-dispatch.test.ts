@@ -10,6 +10,7 @@ import {
   committedFiles,
   configuredWorkerCapacity,
   configuredWorkerLanesPerCredential,
+  dispatchBee,
   drain,
   finishDispatch,
   missingProviderRefusal,
@@ -126,7 +127,7 @@ describe('queen dispatch precheck', () => {
      * sent to /chat must all describe that same six-key pool. A duplicated
      * value is one credential, and no key value may enter public telemetry.
      */
-    it('rotates all six distinct credentials configured for one remote endpoint', () => {
+    it('connects six distinct credentials behind the four-worker policy ceiling', () => {
       process.env.TRIOS_QUEEN_WORKER_PROVIDER = 'zai'
       process.env.TRIOS_QUEEN_WORKER_BASE_URL = 'https://api.z.ai/api/paas/v4'
       process.env.TRIOS_QUEEN_WORKER_MODEL = 'glm-4.5-flash'
@@ -139,7 +140,7 @@ describe('queen dispatch precheck', () => {
       expect(workerCapacityBreakdown()).toEqual({
         connectedCredentials: 6,
         lanesPerCredential: 1,
-        effectiveCapacity: 6,
+        effectiveCapacity: 4,
       })
       const choices = Array.from({ length: 6 }, (_, occupied) =>
         resolveWorkerProvider(Array.from({ length: occupied }, (_, i) => i)),
@@ -154,6 +155,32 @@ describe('queen dispatch precheck', () => {
         Array(6).fill(6),
       )
       expect(resolveWorkerProvider([0, 1, 2, 3, 4, 5])?.exhausted).toBe(6)
+    })
+
+    it('continues after the last assigned key so all six participate across four-Bee waves', () => {
+      process.env.TRIOS_QUEEN_WORKER_PROVIDER = 'zai'
+      process.env.TRIOS_QUEEN_WORKER_BASE_URL = 'https://api.z.ai/api/paas/v4'
+      process.env.TRIOS_QUEEN_WORKER_MODEL = 'glm-4.5-flash'
+      ;['a', 'b', 'c', 'd', 'e', 'f'].forEach((value, index) => {
+        process.env[GENERIC_WORKER_KEYS[index]] = value
+      })
+
+      const wave = (after: number | undefined) => {
+        const selected: number[] = []
+        let cursor = after
+        for (let bee = 0; bee < 4; bee++) {
+          const choice = resolveWorkerProvider(selected, cursor)
+          expect(choice?.apiKey).toBeDefined()
+          selected.push(choice?.keyIndex ?? -1)
+          cursor = choice?.keyIndex
+        }
+        return { selected, cursor }
+      }
+
+      const first = wave(undefined)
+      const second = wave(first.cursor)
+      expect(first.selected).toEqual([0, 1, 2, 3])
+      expect(second.selected).toEqual([4, 5, 0, 1])
     })
 
     it('does not invent a credential for a remote endpoint with no API key', () => {
@@ -172,6 +199,22 @@ describe('queen dispatch precheck', () => {
       })
       expect(missingProviderRefusal()).toContain('TRIOS_QUEEN_WORKER_API_KEY')
       expect(missingProviderRefusal()).not.toContain('ZAI_API_KEY')
+    })
+
+    it('names the generic endpoint variable when every configured key is busy', async () => {
+      process.env.TRIOS_QUEEN_WORKER_PROVIDER = 'zai'
+      process.env.TRIOS_QUEEN_WORKER_BASE_URL = 'https://api.z.ai/api/paas/v4'
+      process.env.TRIOS_QUEEN_WORKER_API_KEY = 'a'
+      process.env.TRIOS_QUEEN_WORKER_API_KEY_2 = 'b'
+      const pool = {
+        query: async () => ({ rowCount: 1, rows: [] }),
+      } as unknown as Pool
+
+      const outcome = await dispatchBee(pool, 1308, 'brief', [], [0, 1])
+
+      expect(outcome.started).toBe(false)
+      expect(outcome.detail).toContain('TRIOS_QUEEN_WORKER_API_KEY_3')
+      expect(outcome.detail).not.toContain('ZAI_API_KEY_3')
     })
 
     it('keeps an explicitly local endpoint as one measured lane on any hostname', () => {

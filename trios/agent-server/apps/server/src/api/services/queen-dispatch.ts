@@ -259,6 +259,10 @@ function workerLanesFor(provider: string): number {
   return provider === 'zai' ? configuredWorkerLanesPerCredential() : 1
 }
 
+// The compiled Queen policy currently admits at most four simultaneous Bees.
+// Capacity telemetry must not promise more until that policy changes too.
+const QUEEN_COMPILED_WORKER_LIMIT = 4
+
 /**
  * The closed, anonymous capacity breakdown every capacity number is made of
  * (#1308).
@@ -300,7 +304,10 @@ export function workerCapacityBreakdown(): WorkerCapacityBreakdown {
     return {
       connectedCredentials,
       lanesPerCredential,
-      effectiveCapacity: connectedCredentials * lanesPerCredential,
+      effectiveCapacity: Math.min(
+        connectedCredentials * lanesPerCredential,
+        QUEEN_COMPILED_WORKER_LIMIT,
+      ),
     }
   }
   for (const candidate of WORKER_PROVIDERS) {
@@ -310,7 +317,10 @@ export function workerCapacityBreakdown(): WorkerCapacityBreakdown {
       return {
         connectedCredentials: keys.length,
         lanesPerCredential,
-        effectiveCapacity: keys.length * lanesPerCredential,
+        effectiveCapacity: Math.min(
+          keys.length * lanesPerCredential,
+          QUEEN_COMPILED_WORKER_LIMIT,
+        ),
       }
     }
   }
@@ -380,9 +390,37 @@ function configuredWorkerProvider(): string | null {
   return CONFIGURED_ENDPOINT_PROVIDERS.has(provider) ? provider : null
 }
 
+/**
+ * Select the least-used available credential, scanning circularly after the
+ * last durable assignment. This preserves parallel spreading while ensuring
+ * a four-Bee policy can exercise a six-key pool across successive rounds.
+ */
+function availableKeyIndex(
+  occupancy: number[],
+  laneCount: number,
+  afterKeyIndex?: number,
+): number {
+  const leastBusy = Math.min(
+    ...occupancy.filter((busy) => busy < laneCount),
+    Number.POSITIVE_INFINITY,
+  )
+  if (!Number.isFinite(leastBusy)) return -1
+  const start =
+    typeof afterKeyIndex === 'number' && Number.isInteger(afterKeyIndex)
+      ? ((afterKeyIndex % occupancy.length) + occupancy.length + 1) %
+        occupancy.length
+      : 0
+  for (let offset = 0; offset < occupancy.length; offset++) {
+    const index = (start + offset) % occupancy.length
+    if (occupancy[index] === leastBusy) return index
+  }
+  return -1
+}
+
 function configuredEndpointProvider(
   override: string | undefined,
   takenKeyIndices: number[],
+  afterKeyIndex?: number,
 ): WorkerProvider | null {
   const baseUrl = configuredWorkerBaseUrl()
   if (!baseUrl) return null
@@ -416,9 +454,11 @@ function configuredEndpointProvider(
   // fabricated token. Refuse before worktree creation when no real key exists.
   if (keys.length === 0) return null
 
-  const index = keys.findIndex(
-    (_, candidateIndex) => !takenKeyIndices.includes(candidateIndex),
+  const occupancy = keys.map(
+    (_, candidateIndex) =>
+      takenKeyIndices.filter((taken) => taken === candidateIndex).length,
   )
+  const index = availableKeyIndex(occupancy, 1, afterKeyIndex)
   if (index < 0) {
     return { provider, model, exhausted: keys.length }
   }
@@ -455,13 +495,14 @@ function configuredEndpointProvider(
  */
 export function resolveWorkerProvider(
   takenKeyIndices: number[] = [],
+  afterKeyIndex?: number,
 ): WorkerProvider | null {
   const override = process.env.TRIOS_QUEEN_WORKER_MODEL
   // An explicit endpoint is authoritative, including its refusal. Falling
   // through when it has no key would silently send the bee to a different
   // provider configured by a legacy variable.
   if (configuredWorkerBaseUrl()) {
-    return configuredEndpointProvider(override, takenKeyIndices)
+    return configuredEndpointProvider(override, takenKeyIndices, afterKeyIndex)
   }
   for (const candidate of WORKER_PROVIDERS) {
     const keys = keysFor(candidate.envVar)
@@ -470,19 +511,7 @@ export function resolveWorkerProvider(
       const occupancy = keys.map(
         (_, index) => takenKeyIndices.filter((taken) => taken === index).length,
       )
-      let index = -1
-      let leastBusy = Number.POSITIVE_INFINITY
-      for (
-        let candidateIndex = 0;
-        candidateIndex < keys.length;
-        candidateIndex++
-      ) {
-        const busy = occupancy[candidateIndex]
-        if (busy < laneCount && busy < leastBusy) {
-          index = candidateIndex
-          leastBusy = busy
-        }
-      }
+      const index = availableKeyIndex(occupancy, laneCount, afterKeyIndex)
       // Every lane busy. Reusing one again would be the quiet version of this
       // problem, so report the actual logical capacity reached.
       if (index < 0) {
@@ -2140,6 +2169,7 @@ export async function dispatchBee(
   brief: string,
   ownedPaths: string[],
   takenKeyIndices: number[] = [],
+  afterKeyIndex?: number,
   /**
    * What this bee will be judged by, recorded WITH the dispatch.
    *
@@ -2153,16 +2183,22 @@ export async function dispatchBee(
 ): Promise<DispatchOutcome> {
   const branch = `queen-${issue}`
 
-  const chosen = resolveWorkerProvider(takenKeyIndices)
+  const chosen = resolveWorkerProvider(takenKeyIndices, afterKeyIndex)
   if (chosen?.exhausted !== undefined) {
     // Not a missing credential: every key this deployment has is already
     // carrying a bee. Named separately because the fix is different - one more
     // key, not a first one.
+    const keyVariable = configuredWorkerBaseUrl()
+      ? GENERIC_WORKER_KEY_ENV
+      : WORKER_PROVIDERS.find(
+          (candidate) => candidate.provider === chosen.provider,
+        )?.envVar
+    const nextKey = keyVariable
+      ? `${keyVariable}_${chosen.exhausted + 1}`
+      : 'the matching provider variable'
     const detail =
       `all ${chosen.exhausted} provider key(s) are already in use by bees in ` +
-      'flight. Add another with ZAI_API_KEY_' +
-      String(chosen.exhausted + 1) +
-      ' (or the equivalent for your provider) to widen the swarm.'
+      `flight. Add another with ${nextKey} to widen the swarm.`
     logger.warn('Queen tick chose an issue but every key is busy', {
       issue,
       detail,
