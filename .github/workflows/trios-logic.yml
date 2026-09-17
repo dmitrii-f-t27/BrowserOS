@@ -9,6 +9,9 @@ on:
   pull_request:
     paths:
       - 'trios/rings/**'
+      # The queen policy is duplicated into here for the image build, and the
+      # duplicate-guard below only runs if a change to EITHER copy triggers it.
+      - 'trios/agent-server/queen-core/Sources/**'
       - 'trios/tests/**'
       - 'trios/agent-server/apps/server/src/agent/**'
       - 'trios/Makefile'
@@ -16,6 +19,41 @@ on:
       - '.github/workflows/trios-logic.yml'
 
 jobs:
+  # The queen policy exists TWICE and the two copies must stay byte-identical.
+  #
+  # trios/rings/SR-00/QueenDelegation.swift is where it is read and reviewed.
+  # trios/agent-server/queen-core/Sources/QueenPolicy/QueenDelegation.swift is
+  # the one the Dockerfile copies into the image (`COPY queen-core/Sources
+  # ./Sources`), so it is the one that becomes `queend` and therefore the one
+  # that decides behaviour.
+  #
+  # Editing the wrong one is SILENT. Measured 2026-09-15: raising
+  # maximumConcurrentWorkers in the rings copy, rebuilding and deploying
+  # produced a swarm that reported `capacity: 12` while every tick refused with
+  # "4 workers already running (limit 4)" - the TypeScript mirror had been
+  # raised, the compiled policy had not, and nothing said so. The two files were
+  # byte-identical before that edit, which is exactly why nobody had noticed
+  # they were two files.
+  #
+  # This job is the cheapest possible fix: it does not unify them, it just
+  # refuses to let them differ.
+  policy-copies-agree:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: The two QueenDelegation copies are identical
+        run: |
+          a=trios/rings/SR-00/QueenDelegation.swift
+          b=trios/agent-server/queen-core/Sources/QueenPolicy/QueenDelegation.swift
+          if ! diff -u "$a" "$b"; then
+            echo
+            echo "The queen policy exists in two copies and they have drifted."
+            echo "The image builds from $b, so that copy is what actually runs."
+            echo "Make them identical - editing only one is a change that does nothing."
+            exit 1
+          fi
+          echo "identical: $(wc -l < "$a") lines"
+
   server-units:
     runs-on: ubuntu-latest
     steps:
